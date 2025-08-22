@@ -1,191 +1,245 @@
 import streamlit as st
 import pandas as pd
-import io
-import logging
-from spellchecker import SpellChecker
-from language_tool_python import LanguageToolPublicAPI
-from openpyxl import Workbook
+import openpyxl
 from openpyxl.styles import PatternFill
-from openpyxl.utils.dataframe import dataframe_to_rows
+import io
 import re
-from typing import Dict, List, Tuple
+from textblob import TextBlob
+import language_tool_python
 
-logger = logging.getLogger(__name__)
+# Configure the page
+st.set_page_config(
+    page_title="Excel Spell & Grammar Checker",
+    page_icon="📝",
+    layout="wide"
+)
 
-# Initialize spell checker and grammar tool
+# Initialize language tool for grammar checking
 @st.cache_resource
-def load_checkers(language: str):
-    spell_lang = language.split('-')[0]
-    spell = SpellChecker(language=spell_lang)
-    tool = LanguageToolPublicAPI(language)
-    return spell, tool
-
-def check_spelling(text: str, spell_checker) -> List[str]:
-    """Check spelling in text and return list of misspelled words"""
-    if not isinstance(text, str) or not text.strip():
-        return []
-    
-    # Extract words (remove punctuation and numbers)
-    words = re.findall(r'\b[a-zA-Z]+\b', text.lower())
-    misspelled = spell_checker.unknown(words)
-    return list(misspelled)
-
-def check_grammar(text: str, grammar_tool) -> List[str]:
-    """Check grammar in text and return list of issues"""
-    if not isinstance(text, str) or not text.strip():
-        return []
-
+def load_language_tool():
+    """Load the language tool for grammar checking"""
     try:
-        matches = grammar_tool.check(text)
-        issues = [match.message for match in matches]
-        return issues
+        return language_tool_python.LanguageTool('en-US')
     except Exception as e:
-        logger.error("Grammar check failed: %s", e)
-        return []
+        st.error(f"Error loading grammar checker: {e}")
+        return None
 
-def process_excel_data(excel_data: Dict[str, pd.DataFrame], spell_checker, grammar_tool) -> Tuple[Dict, Dict]:
-    """Process Excel data and return dictionaries of issues by sheet"""
-
-    spelling_issues = {}
-    grammar_issues = {}
-
-    for sheet_name, df in excel_data.items():
-        spelling_issues[sheet_name] = {}
-        grammar_issues[sheet_name] = {}
-
-        for row_idx, row in enumerate(df.itertuples(index=False, name=None)):
-            for col_idx, cell_value in enumerate(row):
-                if pd.notna(cell_value) and isinstance(cell_value, str):
-                    misspelled = check_spelling(cell_value, spell_checker)
-                    if misspelled:
-                        spelling_issues[sheet_name][(row_idx, col_idx)] = misspelled
-
-                    if len(cell_value.split()) > 2:
-                        grammar_errs = check_grammar(cell_value, grammar_tool)
-                        if grammar_errs:
-                            grammar_issues[sheet_name][(row_idx, col_idx)] = grammar_errs
-
-    return spelling_issues, grammar_issues
-
-def create_highlighted_excel(excel_data: Dict[str, pd.DataFrame], spelling_issues, grammar_issues) -> io.BytesIO:
-    """Create Excel file with highlighted issues"""
+def is_text_content(value):
+    """Check if a cell contains text content worth checking"""
+    if pd.isna(value) or value == "":
+        return False
     
-    # Create a new workbook
-    wb = Workbook()
-    wb.remove(wb.active)  # Remove default sheet
+    # Convert to string and check if it's meaningful text
+    text = str(value).strip()
     
-    # Define fill colors
-    spelling_fill = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")  # Light red
-    grammar_fill = PatternFill(start_color="CCCCFF", end_color="CCCCFF", fill_type="solid")   # Light blue
-    both_fill = PatternFill(start_color="FFCCFF", end_color="FFCCFF", fill_type="solid")     # Light purple
+    # Skip if it's just numbers, dates, or very short text
+    if len(text) < 2:
+        return False
     
-    for sheet_name, df in excel_data.items():
-        ws = wb.create_sheet(title=sheet_name)
+    # Skip if it's purely numeric
+    if re.match(r'^[\d\.\,\-\+\%\$\€\£\¥]+$', text):
+        return False
+    
+    # Skip if it's a date format
+    if re.match(r'^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}$', text):
+        return False
+    
+    return True
+
+def check_spelling_and_grammar(text, lang_tool):
+    """Check text for spelling and grammar issues"""
+    issues = []
+    
+    # Spelling check with TextBlob
+    try:
+        blob = TextBlob(text)
+        corrected = blob.correct()
+        if str(blob) != str(corrected):
+            issues.append("Spelling issue detected")
+    except Exception:
+        pass
+    
+    # Grammar check with LanguageTool
+    if lang_tool:
+        try:
+            matches = lang_tool.check(text)
+            if matches:
+                for match in matches:
+                    issues.append(f"Grammar: {match.message}")
+        except Exception:
+            pass
+    
+    return issues
+
+def process_workbook(uploaded_file, lang_tool):
+    """Process the Excel workbook and highlight cells with issues"""
+    
+    # Load the workbook
+    workbook = openpyxl.load_workbook(uploaded_file, data_only=False)
+    
+    # Yellow fill for highlighting issues
+    yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+    
+    issues_found = []
+    total_checked = 0
+    
+    # Process each worksheet
+    for sheet_name in workbook.sheetnames:
+        sheet = workbook[sheet_name]
         
-        # Add data to worksheet
-        for r in dataframe_to_rows(df, index=False, header=True):
-            ws.append(r)
+        st.write(f"Processing sheet: **{sheet_name}**")
+        progress_bar = st.progress(0)
         
-        # Apply highlighting
-        for row_idx in range(len(df)):
-            for col_idx in range(len(df.columns)):
-                cell = ws.cell(row=row_idx + 2, column=col_idx + 1)  # +2 for header and 0-based indexing
+        # Get all cells with data
+        max_row = sheet.max_row
+        max_col = sheet.max_column
+        
+        cell_count = 0
+        total_cells = max_row * max_col
+        
+        for row in range(1, max_row + 1):
+            for col in range(1, max_col + 1):
+                cell = sheet.cell(row=row, column=col)
                 
-                has_spelling = (row_idx, col_idx) in spelling_issues.get(sheet_name, {})
-                has_grammar = (row_idx, col_idx) in grammar_issues.get(sheet_name, {})
+                # Update progress
+                cell_count += 1
+                if cell_count % 100 == 0:  # Update every 100 cells
+                    progress_bar.progress(min(cell_count / total_cells, 1.0))
                 
-                if has_spelling and has_grammar:
-                    cell.fill = both_fill
-                elif has_spelling:
-                    cell.fill = spelling_fill
-                elif has_grammar:
-                    cell.fill = grammar_fill
+                if cell.value and is_text_content(cell.value):
+                    total_checked += 1
+                    text = str(cell.value).strip()
+                    
+                    # Check for issues
+                    issues = check_spelling_and_grammar(text, lang_tool)
+                    
+                    if issues:
+                        # Highlight the cell
+                        cell.fill = yellow_fill
+                        
+                        # Add comment with issues
+                        if cell.comment:
+                            existing_comment = cell.comment.text
+                            cell.comment.text = f"{existing_comment}\n\nSpell/Grammar Issues:\n" + "\n".join(issues)
+                        else:
+                            cell.comment = openpyxl.comments.Comment(
+                                text=f"Spell/Grammar Issues:\n" + "\n".join(issues),
+                                author="Spell Checker"
+                            )
+                        
+                        issues_found.append({
+                            'Sheet': sheet_name,
+                            'Cell': f"{openpyxl.utils.get_column_letter(col)}{row}",
+                            'Text': text,
+                            'Issues': "; ".join(issues)
+                        })
+        
+        progress_bar.progress(1.0)
     
-    # Save to BytesIO
-    output = io.BytesIO()
-    wb.save(output)
-    output.seek(0)
-    return output
+    return workbook, issues_found, total_checked
 
 def main():
     st.title("📝 Excel Spell & Grammar Checker")
-    st.write("Upload Excel files to check for spelling and grammar issues. Issues will be highlighted in the output file.")
-
-    language = st.sidebar.selectbox("Language", ["en-US", "en-GB"])
-
-    with st.spinner("Loading spell and grammar checkers..."):
-        spell_checker, grammar_tool = load_checkers(language)
-
-    uploaded_files = st.file_uploader(
-        "Choose Excel files",
-        type=["xlsx", "xls"],
-        accept_multiple_files=True,
-        help="Upload one or more Excel files for spell and grammar checking",
+    st.markdown("Upload an Excel workbook to check for spelling and grammar issues across all sheets.")
+    
+    # File upload
+    uploaded_file = st.file_uploader(
+        "Choose an Excel file",
+        type=['xlsx', 'xls'],
+        help="Upload an Excel workbook (.xlsx or .xls format)"
     )
-
-    if uploaded_files:
-        for uploaded_file in uploaded_files:
-            st.subheader(f"Processing: {uploaded_file.name}")
-
-            with st.spinner(f"Analyzing {uploaded_file.name}..."):
+    
+    if uploaded_file is not None:
+        st.success(f"File uploaded: {uploaded_file.name}")
+        
+        # Load language tool
+        with st.spinner("Loading spell and grammar checker..."):
+            lang_tool = load_language_tool()
+        
+        if st.button("🔍 Check Spelling & Grammar", type="primary"):
+            with st.spinner("Processing workbook... This may take a few minutes for large files."):
                 try:
-                    excel_data = pd.read_excel(uploaded_file, sheet_name=None, engine="openpyxl")
-                    spelling_issues, grammar_issues = process_excel_data(excel_data, spell_checker, grammar_tool)
-                    display_results(excel_data, spelling_issues, grammar_issues, uploaded_file.name)
+                    # Process the workbook
+                    processed_workbook, issues_found, total_checked = process_workbook(uploaded_file, lang_tool)
+                    
+                    # Show summary
+                    st.subheader("📊 Summary")
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.metric("Cells Checked", total_checked)
+                    with col2:
+                        st.metric("Issues Found", len(issues_found))
+                    with col3:
+                        accuracy = ((total_checked - len(issues_found)) / total_checked * 100) if total_checked > 0 else 0
+                        st.metric("Accuracy", f"{accuracy:.1f}%")
+                    
+                    # Show issues found
+                    if issues_found:
+                        st.subheader("⚠️ Issues Found")
+                        df_issues = pd.DataFrame(issues_found)
+                        st.dataframe(df_issues, use_container_width=True)
+                        
+                        # Create download for processed file
+                        output = io.BytesIO()
+                        processed_workbook.save(output)
+                        output.seek(0)
+                        
+                        # Generate filename
+                        original_name = uploaded_file.name.rsplit('.', 1)[0]
+                        download_name = f"{original_name}_spell_checked.xlsx"
+                        
+                        st.download_button(
+                            label="📥 Download Corrected File",
+                            data=output.getvalue(),
+                            file_name=download_name,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            type="primary"
+                        )
+                        
+                        st.info("💡 **Note:** Cells with issues are highlighted in yellow and include comments with details about the problems found.")
+                        
+                    else:
+                        st.success("🎉 No spelling or grammar issues found!")
+                        st.balloons()
+                        
+                        # Still offer download of original file
+                        output = io.BytesIO()
+                        processed_workbook.save(output)
+                        output.seek(0)
+                        
+                        original_name = uploaded_file.name.rsplit('.', 1)[0]
+                        download_name = f"{original_name}_checked.xlsx"
+                        
+                        st.download_button(
+                            label="📥 Download File",
+                            data=output.getvalue(),
+                            file_name=download_name,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+                
                 except Exception as e:
-                    st.error(f"Error processing {uploaded_file.name}: {str(e)}")
-
-            st.write("---")
-
-
-def display_results(excel_data, spelling_issues, grammar_issues, filename):
-    total_spelling = sum(len(issues) for issues in spelling_issues.values())
-    total_grammar = sum(len(issues) for issues in grammar_issues.values())
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Sheets Processed", len(spelling_issues))
-    with col2:
-        st.metric("Spelling Issues", total_spelling)
-    with col3:
-        st.metric("Grammar Issues", total_grammar)
-
-    if total_spelling > 0 or total_grammar > 0:
-        with st.expander("View Detailed Issues"):
-            for sheet_name in spelling_issues.keys():
-                if spelling_issues[sheet_name] or grammar_issues[sheet_name]:
-                    st.write(f"**Sheet: {sheet_name}**")
-
-                    if spelling_issues[sheet_name]:
-                        st.write("🔤 Spelling Issues:")
-                        for (row, col), words in spelling_issues[sheet_name].items():
-                            st.write(f"  Row {row+1}, Column {col+1}: {', '.join(words)}")
-
-                    if grammar_issues[sheet_name]:
-                        st.write("📝 Grammar Issues:")
-                        for (row, col), issues in grammar_issues[sheet_name].items():
-                            st.write(f"  Row {row+1}, Column {col+1}: {'; '.join(issues)}")
-
-                    st.write("---")
-
-        with st.spinner("Creating highlighted Excel file..."):
-            highlighted_file = create_highlighted_excel(excel_data, spelling_issues, grammar_issues)
-
-        download_name = filename.replace('.xlsx', '_checked.xlsx').replace('.xls', '_checked.xlsx')
-        st.download_button(
-            label=f"📥 Download {download_name}",
-            data=highlighted_file,
-            file_name=download_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-        st.write("**Legend:**")
-        st.write("🔴 Light Red = Spelling Issues")
-        st.write("🔵 Light Blue = Grammar Issues")
-        st.write("🟣 Light Purple = Both Spelling & Grammar Issues")
-
-    else:
-        st.success("✅ No spelling or grammar issues found!")
+                    st.error(f"Error processing file: {str(e)}")
+                    st.error("Please make sure you've uploaded a valid Excel file.")
+    
+    # Instructions
+    with st.expander("ℹ️ How to use this tool"):
+        st.markdown("""
+        1. **Upload** your Excel workbook using the file uploader above
+        2. **Click** the "Check Spelling & Grammar" button to start processing
+        3. **Review** the summary and list of issues found
+        4. **Download** the processed file with highlighted cells
+        
+        **Features:**
+        - ✅ Processes all sheets in the workbook
+        - ✅ Highlights problematic cells in yellow
+        - ✅ Adds comments to cells explaining the issues
+        - ✅ Checks both spelling and grammar
+        - ✅ Preserves original formatting and formulas
+        - ✅ Shows detailed summary of issues found
+        
+        **Note:** The tool will only check cells that contain meaningful text content (not numbers, dates, or very short text).
+        """)
 
 if __name__ == "__main__":
     main()
