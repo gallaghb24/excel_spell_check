@@ -5,7 +5,7 @@ from openpyxl.styles import PatternFill
 import io
 import re
 from textblob import TextBlob
-import language_tool_python
+from spellchecker import SpellChecker
 
 # Configure the page
 st.set_page_config(
@@ -14,14 +14,14 @@ st.set_page_config(
     layout="wide"
 )
 
-# Initialize language tool for grammar checking
+# Initialize spell checker
 @st.cache_resource
-def load_language_tool():
-    """Load the language tool for grammar checking"""
+def load_spell_checker():
+    """Load the spell checker"""
     try:
-        return language_tool_python.LanguageTool('en-US')
+        return SpellChecker()
     except Exception as e:
-        st.error(f"Error loading grammar checker: {e}")
+        st.error(f"Error loading spell checker: {e}")
         return None
 
 def is_text_content(value):
@@ -46,32 +46,55 @@ def is_text_content(value):
     
     return True
 
-def check_spelling_and_grammar(text, lang_tool):
+def check_spelling_and_grammar(text, spell_checker):
     """Check text for spelling and grammar issues"""
     issues = []
     
-    # Spelling check with TextBlob
-    try:
-        blob = TextBlob(text)
-        corrected = blob.correct()
-        if str(blob) != str(corrected):
-            issues.append("Spelling issue detected")
-    except Exception:
-        pass
+    # Clean the text for checking
+    text_clean = re.sub(r'[^\w\s\'\-]', ' ', text)
+    words = text_clean.lower().split()
     
-    # Grammar check with LanguageTool
-    if lang_tool:
+    # Spelling check with pyspellchecker
+    if spell_checker:
         try:
-            matches = lang_tool.check(text)
-            if matches:
-                for match in matches:
-                    issues.append(f"Grammar: {match.message}")
+            misspelled = spell_checker.unknown(words)
+            if misspelled:
+                issues.append(f"Possible misspelled words: {', '.join(list(misspelled)[:3])}")
         except Exception:
             pass
     
+    # Basic grammar check with TextBlob
+    try:
+        blob = TextBlob(text)
+        
+        # Check for very basic grammar issues
+        # Multiple consecutive spaces
+        if re.search(r'\s{2,}', text):
+            issues.append("Multiple consecutive spaces found")
+        
+        # Missing capitalization at start of sentence
+        sentences = blob.sentences
+        for sentence in sentences:
+            sentence_str = str(sentence).strip()
+            if sentence_str and sentence_str[0].islower():
+                # Check if it's not an intentional lowercase start (like an acronym)
+                if len(sentence_str.split()) > 1:
+                    issues.append("Sentence may need capitalization")
+                break  # Only report once per cell
+        
+        # Check for repeated words
+        words_in_text = text.lower().split()
+        for i in range(len(words_in_text) - 1):
+            if words_in_text[i] == words_in_text[i + 1] and len(words_in_text[i]) > 2:
+                issues.append("Repeated word detected")
+                break  # Only report once per cell
+                
+    except Exception:
+        pass
+    
     return issues
 
-def process_workbook(uploaded_file, lang_tool):
+def process_workbook(uploaded_file, spell_checker):
     """Process the Excel workbook and highlight cells with issues"""
     
     # Load the workbook
@@ -111,7 +134,7 @@ def process_workbook(uploaded_file, lang_tool):
                     text = str(cell.value).strip()
                     
                     # Check for issues
-                    issues = check_spelling_and_grammar(text, lang_tool)
+                    issues = check_spelling_and_grammar(text, spell_checker)
                     
                     if issues:
                         # Highlight the cell
@@ -152,15 +175,15 @@ def main():
     if uploaded_file is not None:
         st.success(f"File uploaded: {uploaded_file.name}")
         
-        # Load language tool
-        with st.spinner("Loading spell and grammar checker..."):
-            lang_tool = load_language_tool()
+        # Load spell checker
+        with st.spinner("Loading spell checker..."):
+            spell_checker = load_spell_checker()
         
         if st.button("🔍 Check Spelling & Grammar", type="primary"):
             with st.spinner("Processing workbook... This may take a few minutes for large files."):
                 try:
                     # Process the workbook
-                    processed_workbook, issues_found, total_checked = process_workbook(uploaded_file, lang_tool)
+                    processed_workbook, issues_found, total_checked = process_workbook(uploaded_file, spell_checker)
                     
                     # Show summary
                     st.subheader("📊 Summary")
